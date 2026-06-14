@@ -6,6 +6,37 @@
    ============================================================ */
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const fs = require('fs');
+const path = require('path');
+
+/* ---------- persistent player stats (keyed by wallet) ---------- */
+// On Render, attach a free Disk and set DATA_DIR to its mount path for true persistence.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DB_FILE = path.join(DATA_DIR, 'players.json');
+let DB = {}; // wallet -> { name, kills, deaths, wins, matches, score, bestStreak }
+try { DB = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { DB = {}; }
+let _dbDirty = false;
+function dbGet(wallet, name) {
+  if (!wallet) wallet = 'guest:' + (name || 'OPERATOR');
+  if (!DB[wallet]) DB[wallet] = { name: name || 'OPERATOR', kills: 0, deaths: 0, wins: 0, matches: 0, score: 0, bestStreak: 0 };
+  if (name) DB[wallet].name = name;
+  return DB[wallet];
+}
+function dbMark() { _dbDirty = true; }
+function dbSave() { if (!_dbDirty) return; _dbDirty = false; try { fs.writeFileSync(DB_FILE, JSON.stringify(DB)); } catch (e) {} }
+setInterval(dbSave, 5000);
+
+function leaderboard(cat, limit) {
+  const key = ['kd', 'kills', 'score', 'wins', 'bestStreak'].includes(cat) ? cat : 'kills';
+  const rows = Object.entries(DB).map(([wallet, s]) => {
+    const kd = s.deaths > 0 ? s.kills / s.deaths : s.kills;
+    return { name: s.name, wallet: wallet.length > 8 ? wallet.slice(0, 4) + '\u2026' + wallet.slice(-4) : wallet,
+             kills: s.kills, deaths: s.deaths, wins: s.wins, score: s.score,
+             bestStreak: s.bestStreak, kd: +kd.toFixed(2), matches: s.matches };
+  }).filter(r => r.matches > 0);
+  rows.sort((a, b) => b[key] - a[key]);
+  return rows.slice(0, limit || 100);
+}
 
 const PORT = process.env.PORT || 8080;
 const TICK = 1000 / 20;          // 20 broadcasts/sec
@@ -18,8 +49,16 @@ const QUEUE_COUNTDOWN = 8;       // seconds of "starting soon" once minimum is m
 const QUEUE_MAX_WAIT = 90;       // safety: start anyway after this long if 2+ waiting
 const QUEUE_MIN_FALLBACK = 2;    // ...with at least this many
 
-// health check so hosts know the server is alive
+// HTTP: health check + leaderboard endpoint
 const server = http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (req.url && req.url.startsWith('/leaderboard')) {
+    const u = new URL(req.url, 'http://x');
+    const cat = u.searchParams.get('cat') || 'kills';
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(leaderboard(cat, 100)));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('THE TRENCHES server OK\n');
 });
@@ -191,11 +230,27 @@ wss.on('connection', (ws) => {
         send(tgt.ws, { t: 'hurt', by: player.id, dmg: m.dmg, hp: tgt.hp });
         if (tgt.hp <= 0) {
           player.kills++; tgt.deaths++;
+          player.streak = (player.streak || 0) + 1;
+          tgt.streak = 0;
+          // ---- lifetime stats to the database ----
+          const ks = dbGet(player.wallet, player.name);
+          ks.kills++; ks.score += 100; if (player.streak > ks.bestStreak) ks.bestStreak = player.streak;
+          const vs = dbGet(tgt.wallet, tgt.name); vs.deaths++;
+          dbMark();
           broadcast(room, { t: 'kill', killer: player.id, victim: tgt.id,
                             kn: player.name, vn: tgt.name, head: !!m.head });
           tgt.hp = 100;
         }
       }
+      return;
+    }
+    if (m.t === 'lb') {              // client asking for the global leaderboard
+      send(ws, { t: 'lb', cat: m.cat || 'kills', rows: leaderboard(m.cat, 50) });
+      return;
+    }
+    if (m.t === 'endmatch') {        // client reports its match finished (records match + win)
+      const s = dbGet(player.wallet, player.name);
+      s.matches++; if (m.won) s.wins++; dbMark();
       return;
     }
     if (m.t === 'chat') {
