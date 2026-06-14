@@ -1,0 +1,15 @@
+{
+  "name": "nukeblock-server",
+  "version": "1.0.0",
+  "description": "NUKEBLOCK: GUN RUN multiplayer relay server (up to 12 players)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
