@@ -3,11 +3,19 @@
    A tiny authoritative-ish relay for up to 12 players per room.
    Node.js + ws. No database. Rooms live in memory.
    Deploy on Render/Railway/Fly. See SETUP steps in chat.
+
+   RESET THE LEADERBOARD FOR EVERYONE:
+     After this is deployed, open this URL once in your browser:
+       https://the-trenches-server.onrender.com/reset?key=trench-wipe-9271
+     It clears all player stats. (Change the key below if you want.)
    ============================================================ */
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const fs = require('fs');
 const path = require('path');
+
+/* secret key for the /reset endpoint — change it to whatever you like */
+const RESET_KEY = process.env.RESET_KEY || 'trench-wipe-9271';
 
 /* ---------- persistent player stats (keyed by wallet) ---------- */
 // On Render, attach a free Disk and set DATA_DIR to its mount path for true persistence.
@@ -50,9 +58,32 @@ const QUEUE_COUNTDOWN = 6;       // seconds of "starting soon" once minimum is m
 const QUEUE_MAX_WAIT = 45;       // safety: start anyway after this long if 2+ waiting
 const QUEUE_MIN_FALLBACK = 2;    // ...with at least this many
 
-// HTTP: health check + leaderboard endpoint
+// HTTP: health check + leaderboard endpoint + reset endpoint
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+
+  // ---- live online count: ?  -> {n: number of connected sockets} ----
+  if (req.url && req.url.startsWith('/online')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ n: wss.clients.size }));
+    return;
+  }
+
+  // ---- RESET the whole leaderboard (wipes everyone's stats) ----
+  if (req.url && req.url.startsWith('/reset')) {
+    const u = new URL(req.url, 'http://x');
+    if (u.searchParams.get('key') !== RESET_KEY) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('FORBIDDEN — wrong or missing key\n');
+      return;
+    }
+    DB = {};                       // wipe all player stats in memory
+    _dbDirty = true; dbSave();     // overwrite players.json with {}
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('LEADERBOARD RESET — ALL STATS CLEARED\n');
+    return;
+  }
+
   if (req.url && req.url.startsWith('/leaderboard')) {
     const u = new URL(req.url, 'http://x');
     const cat = u.searchParams.get('cat') || 'kills';
@@ -155,8 +186,14 @@ wss.on('connection', (ws) => {
   let player = null;
   let room = null;
 
+  // tell this client the current online count, and refresh everyone's
+  broadcastOnline();
+
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw); } catch (e) { return; }
+
+    /* ----- client asking for the live online count ----- */
+    if (m.t === 'online') { send(ws, { t: 'online', n: wss.clients.size }); return; }
 
     /* ----- create / join a room ----- */
     if (m.t === 'create') {
@@ -249,7 +286,8 @@ wss.on('connection', (ws) => {
     }
     if (m.t === 'hit') {              // shooter claims a hit on target id
       const tgt = room.players.get(m.id);
-      if (tgt && !tgt.dead) {         // ignore hits on someone already downed (stops double/triple counting)
+      // never credit a hit on yourself, and ignore hits on someone already downed
+      if (tgt && tgt.id !== player.id && !tgt.dead) {
         tgt.hp = Math.max(0, (tgt.hp ?? 100) - (m.dmg || 0));
         send(tgt.ws, { t: 'hurt', by: player.id, dmg: m.dmg, hp: tgt.hp });
         if (tgt.hp <= 0) {
@@ -261,7 +299,8 @@ wss.on('connection', (ws) => {
           ks.kills++; ks.score += 100; if (player.streak > ks.bestStreak) ks.bestStreak = player.streak;
           const vs = dbGet(tgt.wallet, tgt.name); vs.deaths++;
           dbMark();
-          broadcast(room, { t: 'kill', killer: player.id, victim: tgt.id,
+          // a single kill event, tagged with a unique id so the client can de-dup
+          broadcast(room, { t: 'kill', id: 'k' + (nextId++), killer: player.id, victim: tgt.id,
                             kn: player.name, vn: tgt.name, head: !!m.head, wep: player.wep });
           // clear the dead-lock + restore HP after the respawn delay
           tgt.hp = 100;
@@ -302,7 +341,13 @@ wss.on('connection', (ws) => {
         room.hostId = next ? next.id : null;
       }
       broadcast(room, { t: 'left', id: player.id, room: roomState(room) });
+      // if only one player is left alone in an auto match, send them back to the lobby
+      if (room.auto && room.players.size === 1) {
+        const last = room.players.values().next().value;
+        if (last && last.ws && last.ws.readyState === 1) send(last.ws, { t: 'alone' });
+      }
     }
+    broadcastOnline();
   });
 
   function mkPlayer(ws, m) {
@@ -316,6 +361,12 @@ wss.on('connection', (ws) => {
     };
   }
 });
+
+/* broadcast the current online count to every connected socket */
+function broadcastOnline() {
+  const msg = JSON.stringify({ t: 'online', n: wss.clients.size });
+  for (const c of wss.clients) if (c.readyState === 1) c.send(msg);
+}
 
 /* ---------- 20Hz world broadcast ---------- */
 setInterval(() => {
