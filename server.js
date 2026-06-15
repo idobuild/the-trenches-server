@@ -225,21 +225,23 @@ wss.on('connection', (ws) => {
     }
     if (m.t === 'hit') {              // shooter claims a hit on target id
       const tgt = room.players.get(m.id);
-      if (tgt) {
+      if (tgt && !tgt.dead) {         // ignore hits on someone already downed (stops double/triple counting)
         tgt.hp = Math.max(0, (tgt.hp ?? 100) - (m.dmg || 0));
         send(tgt.ws, { t: 'hurt', by: player.id, dmg: m.dmg, hp: tgt.hp });
         if (tgt.hp <= 0) {
+          tgt.dead = true;            // lock out further hits until they respawn
           player.kills++; tgt.deaths++;
           player.streak = (player.streak || 0) + 1;
           tgt.streak = 0;
-          // ---- lifetime stats to the database ----
           const ks = dbGet(player.wallet, player.name);
           ks.kills++; ks.score += 100; if (player.streak > ks.bestStreak) ks.bestStreak = player.streak;
           const vs = dbGet(tgt.wallet, tgt.name); vs.deaths++;
           dbMark();
           broadcast(room, { t: 'kill', killer: player.id, victim: tgt.id,
                             kn: player.name, vn: tgt.name, head: !!m.head });
+          // clear the dead-lock + restore HP after the respawn delay
           tgt.hp = 100;
+          setTimeout(() => { if (tgt) { tgt.dead = false; tgt.hp = 100; } }, 2500);
         }
       }
       return;
