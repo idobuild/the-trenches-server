@@ -47,6 +47,30 @@ function leaderboard(cat, limit) {
   return rows.slice(0, limit || 100);
 }
 
+/* ---------- ZOMBIES global stats (keyed by wallet) ---------- */
+const ZDB_FILE = path.join(DATA_DIR, 'zombies.json');
+let ZDB = {}; // wallet -> { name, bestRound, bestScore, kills, hs, games, totalPoints }
+try { ZDB = JSON.parse(fs.readFileSync(ZDB_FILE, 'utf8')); } catch (e) { ZDB = {}; }
+let _zDirty = false;
+function zGet(wallet, name) {
+  if (!wallet) wallet = 'guest:' + (name || 'OPERATOR');
+  if (!ZDB[wallet]) ZDB[wallet] = { name: name || 'OPERATOR', bestRound: 0, bestScore: 0, kills: 0, hs: 0, games: 0, totalPoints: 0 };
+  if (name) ZDB[wallet].name = name;
+  return ZDB[wallet];
+}
+function zSave() { if (!_zDirty) return; _zDirty = false; try { fs.writeFileSync(ZDB_FILE, JSON.stringify(ZDB)); } catch (e) {} }
+setInterval(zSave, 5000);
+function zleaderboard(cat, limit) {
+  const key = ['bestRound', 'bestScore', 'kills', 'hs', 'games', 'totalPoints'].includes(cat) ? cat : 'bestRound';
+  const rows = Object.entries(ZDB).map(([wallet, s]) => ({
+    name: s.name, wallet: wallet.length > 8 ? wallet.slice(0, 4) + '\u2026' + wallet.slice(-4) : wallet,
+    bestRound: s.bestRound||0, bestScore: s.bestScore||0, kills: s.kills||0,
+    hs: s.hs||0, games: s.games||0, totalPoints: s.totalPoints||0
+  })).filter(r => r.games > 0);
+  rows.sort((a, b) => b[key] - a[key]);
+  return rows.slice(0, limit || 100);
+}
+
 const PORT = process.env.PORT || 8080;
 const TICK = 1000 / 20;          // 20 broadcasts/sec
 const MAX_PLAYERS = 12;          // hard cap per room
@@ -79,8 +103,18 @@ const server = http.createServer((req, res) => {
     }
     DB = {};                       // wipe all player stats in memory
     _dbDirty = true; dbSave();     // overwrite players.json with {}
+    ZDB = {};                      // wipe zombies stats too
+    _zDirty = true; zSave();
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('LEADERBOARD RESET — ALL STATS CLEARED\n');
+    return;
+  }
+
+  if (req.url && req.url.startsWith('/zleaderboard')) {
+    const u = new URL(req.url, 'http://x');
+    const cat = u.searchParams.get('cat') || 'bestRound';
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(zleaderboard(cat, 100)));
     return;
   }
 
@@ -194,6 +228,20 @@ wss.on('connection', (ws) => {
 
     /* ----- client asking for the live online count ----- */
     if (m.t === 'online') { send(ws, { t: 'online', n: wss.clients.size }); return; }
+
+    /* ----- submit a Zombies result to the global Zombies board ----- */
+    if (m.t === 'zsubmit') {
+      const s = zGet(('' + (m.wallet || '')).slice(0, 44), ('' + (m.name || 'OPERATOR')).toUpperCase().slice(0, 16));
+      s.games = (s.games || 0) + 1;
+      s.kills = (s.kills || 0) + (m.kills | 0);
+      s.hs = (s.hs || 0) + (m.hs | 0);
+      s.totalPoints = (s.totalPoints || 0) + (m.points | 0);
+      if ((m.round | 0) > (s.bestRound || 0)) s.bestRound = m.round | 0;
+      if ((m.points | 0) > (s.bestScore || 0)) s.bestScore = m.points | 0;
+      _zDirty = true;
+      send(ws, { t: 'zok' });
+      return;
+    }
 
     /* ----- create / join a room ----- */
     if (m.t === 'create') {
@@ -341,10 +389,17 @@ wss.on('connection', (ws) => {
         room.hostId = next ? next.id : null;
       }
       broadcast(room, { t: 'left', id: player.id, room: roomState(room) });
-      // if only one player is left alone in an auto match, send them back to the lobby
-      if (room.auto && room.players.size === 1) {
+      // if only one player is left alone in a match, pull them out and send them to re-matchmake
+      if (room.players.size === 1) {
         const last = room.players.values().next().value;
-        if (last && last.ws && last.ws.readyState === 1) send(last.ws, { t: 'alone' });
+        if (last && last.ws && last.ws.readyState === 1) {
+          send(last.ws, { t: 'alone' });
+          // free the lone player from this now-dead room so they can join/queue fresh
+          room.players.delete(last.id);
+          last.ws._room = null; last.ws._player = null;
+        }
+        room.hostId = null;
+        room.lastSeen = 0; // mark for immediate reap on next tick
       }
     }
     broadcastOnline();
