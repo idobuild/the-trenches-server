@@ -18,7 +18,8 @@ try { DB = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { DB = {}; 
 let _dbDirty = false;
 function dbGet(wallet, name) {
   if (!wallet) wallet = 'guest:' + (name || 'OPERATOR');
-  if (!DB[wallet]) DB[wallet] = { name: name || 'OPERATOR', kills: 0, deaths: 0, wins: 0, matches: 0, score: 0, bestStreak: 0 };
+  if (!DB[wallet]) DB[wallet] = { name: name || 'OPERATOR', kills: 0, deaths: 0, wins: 0, matches: 0, score: 0, bestStreak: 0, nukes: 0 };
+  if (DB[wallet].nukes == null) DB[wallet].nukes = 0; // migrate older records
   if (name) DB[wallet].name = name;
   return DB[wallet];
 }
@@ -27,12 +28,12 @@ function dbSave() { if (!_dbDirty) return; _dbDirty = false; try { fs.writeFileS
 setInterval(dbSave, 5000);
 
 function leaderboard(cat, limit) {
-  const key = ['kd', 'kills', 'score', 'wins', 'bestStreak'].includes(cat) ? cat : 'kills';
+  const key = ['kd', 'kills', 'score', 'wins', 'bestStreak', 'nukes'].includes(cat) ? cat : 'kills';
   const rows = Object.entries(DB).map(([wallet, s]) => {
     const kd = s.deaths > 0 ? s.kills / s.deaths : s.kills;
     return { name: s.name, wallet: wallet.length > 8 ? wallet.slice(0, 4) + '\u2026' + wallet.slice(-4) : wallet,
              kills: s.kills, deaths: s.deaths, wins: s.wins, score: s.score,
-             bestStreak: s.bestStreak, kd: +kd.toFixed(2), matches: s.matches };
+             bestStreak: s.bestStreak, nukes: s.nukes||0, kd: +kd.toFixed(2), matches: s.matches };
   }).filter(r => r.matches > 0);
   rows.sort((a, b) => b[key] - a[key]);
   return rows.slice(0, limit || 100);
@@ -44,9 +45,9 @@ const MAX_PLAYERS = 12;          // hard cap per room
 const ROOM_EMPTY_MS = 60 * 1000; // close empty room after 60s
 
 // ---- public quick-play matchmaking ----
-const QUEUE_START = 4;           // start a game once this many are waiting
-const QUEUE_COUNTDOWN = 8;       // seconds of "starting soon" once minimum is met
-const QUEUE_MAX_WAIT = 90;       // safety: start anyway after this long if 2+ waiting
+const QUEUE_START = 2;           // start a game once this many are waiting
+const QUEUE_COUNTDOWN = 6;       // seconds of "starting soon" once minimum is met
+const QUEUE_MAX_WAIT = 45;       // safety: start anyway after this long if 2+ waiting
 const QUEUE_MIN_FALLBACK = 2;    // ...with at least this many
 
 // HTTP: health check + leaderboard endpoint
@@ -113,7 +114,10 @@ function launchQueue(mode) {
     e.ws._room = room; e.ws._player = p; e.ws._qmode = null;
   });
   // tell everyone the match is starting and drop them in
-  broadcast(room, { t: 'matchstart', mode, room: roomState(room) });
+  // tell each player the match is starting, with their own id
+  for (const p of room.players.values()) {
+    send(p.ws, { t: 'matchstart', mode, you: p.id, room: roomState(room) });
+  }
   queueBroadcast(mode); // refresh anyone still waiting
 }
 
@@ -186,10 +190,30 @@ wss.on('connection', (ws) => {
     if (m.t === 'quickplay') {
       const mode = (m.mode === 'tdm') ? 'tdm' : 'gun';
       leaveAllQueues(ws);                 // never in two queues at once
-      player = mkPlayer(ws, m);           // pre-build the player record
+      player = mkPlayer(ws, m);           // build the player record
+      // FIRST: try to drop into an existing in-progress game of this mode that has room
+      let joined = null;
+      for (const [, rm] of rooms) {
+        if (rm.auto && rm.mode === mode && rm.players.size > 0 && rm.players.size < MAX_PLAYERS) { joined = rm; break; }
+      }
+      if (joined) {
+        // balance teams for tdm by filling the smaller side
+        if (mode === 'tdm') {
+          let t0 = 0, t1 = 0; for (const p of joined.players.values()) (p.team === 0 ? t0++ : t1++);
+          player.team = (t0 <= t1) ? 0 : 1;
+        } else player.team = 0;
+        joined.players.set(player.id, player);
+        if (joined.hostId == null) joined.hostId = player.id;
+        ws._room = joined; ws._player = player; ws._qmode = null;
+        room = joined;
+        // tell the newcomer to start, and let everyone see them
+        send(ws, { t: 'matchstart', mode, you: player.id, room: roomState(joined) });
+        broadcast(joined, { t: 'playerjoined', id: player.id, room: roomState(joined) }, player.id);
+        return;
+      }
+      // otherwise wait in the queue for a fresh game
       queues[mode].push({ ws, player, waitStart: null });
       resetQueueTimer(mode);
-      // remember which queue this socket is in so we can pull them into the room later
       ws._qmode = mode;
       send(ws, { t: 'queued', mode });
       queueBroadcast(mode);
@@ -238,7 +262,7 @@ wss.on('connection', (ws) => {
           const vs = dbGet(tgt.wallet, tgt.name); vs.deaths++;
           dbMark();
           broadcast(room, { t: 'kill', killer: player.id, victim: tgt.id,
-                            kn: player.name, vn: tgt.name, head: !!m.head });
+                            kn: player.name, vn: tgt.name, head: !!m.head, wep: player.wep });
           // clear the dead-lock + restore HP after the respawn delay
           tgt.hp = 100;
           setTimeout(() => { if (tgt) { tgt.dead = false; tgt.hp = 100; } }, 2500);
@@ -253,6 +277,11 @@ wss.on('connection', (ws) => {
     if (m.t === 'endmatch') {        // client reports its match finished (records match + win)
       const s = dbGet(player.wallet, player.name);
       s.matches++; if (m.won) s.wins++; dbMark();
+      return;
+    }
+    if (m.t === 'nuke') {            // client earned a tactical nuke
+      const s = dbGet(player.wallet, player.name);
+      s.nukes = (s.nukes || 0) + 1; dbMark();
       return;
     }
     if (m.t === 'chat') {
@@ -310,7 +339,7 @@ setInterval(() => {
     if (room.players.size > 0) {
       const snap = [...room.players.values()].map(p => ({
         id: p.id, x: p.x, y: p.y, z: p.z, yaw: p.yaw, pitch: p.pitch,
-        anim: p.anim, wep: p.wep, hp: p.hp, team: p.team,
+        anim: p.anim, wep: p.wep, hp: p.hp, team: p.team, name: p.name, wallet: p.wallet,
         kills: p.kills, deaths: p.deaths
       }));
       broadcast(room, { t: 'snap', players: snap });
