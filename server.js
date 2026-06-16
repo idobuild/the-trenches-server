@@ -43,7 +43,7 @@ function leaderboard(cat, limit) {
              walletFull: wallet,
              kills: s.kills, deaths: s.deaths, wins: s.wins, score: s.score,
              bestStreak: s.bestStreak, nukes: s.nukes||0, kd: +kd.toFixed(2), matches: s.matches };
-  }).filter(r => r.matches > 0);
+  }).filter(r => r.matches > 0 || r.kills > 0 || r.deaths > 0);
   rows.sort((a, b) => b[key] - a[key]);
   return rows.slice(0, limit || 100);
 }
@@ -68,7 +68,7 @@ function zleaderboard(cat, limit) {
     walletFull: wallet,
     bestRound: s.bestRound||0, bestScore: s.bestScore||0, kills: s.kills||0,
     hs: s.hs||0, games: s.games||0, totalPoints: s.totalPoints||0
-  })).filter(r => r.games > 0);
+  })).filter(r => r.games > 0 || r.bestRound > 0 || r.kills > 0);
   rows.sort((a, b) => b[key] - a[key]);
   return rows.slice(0, limit || 100);
 }
