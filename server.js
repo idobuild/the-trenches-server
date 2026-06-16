@@ -362,23 +362,42 @@ wss.on('connection', (ws) => {
       if (tgt && tgt.id !== player.id && !tgt.dead) {
         // ---- ANTI-CHEAT VALIDATION ----
         const now = Date.now();
-        // 1) rate limit: no more than ~20 damage events/sec from one shooter
+        // 1) hit rate limit: no more than ~18 damage events/sec from one shooter
         player._hitWin = player._hitWin || [];
         player._hitWin = player._hitWin.filter(t => now - t < 1000);
-        if (player._hitWin.length >= 20) return;     // firing impossibly fast -> drop
+        if (player._hitWin.length >= 18) return;       // firing impossibly fast -> drop
         player._hitWin.push(now);
-        // 2) distance sanity: shooter & target positions are known from 'state' updates.
-        //    A bullet can't land if the two are absurdly far apart (shooting across/through the map).
-        const dx = (player.x||0)-(tgt.x||0), dy=(player.y||0)-(tgt.y||0), dz=(player.z||0)-(tgt.z||0);
+        // 2) distance sanity: positions come from 'state'. Reject shots from absurd range
+        //    (shooting across/through the whole map).
+        const dx = (tgt.x||0)-(player.x||0), dy=(tgt.y||0)-(player.y||0), dz=(tgt.z||0)-(player.z||0);
         const dist = Math.sqrt(dx*dx+dy*dy+dz*dz);
-        if (dist > 140) return;                       // beyond any sightline on this map -> drop
-        // 3) clamp damage to a believable per-hit maximum (kills the 9999 one-shot hacks)
+        if (dist > 120) return;
+        // 3) AIM check: the shooter must actually be roughly facing the target. A wallhack /
+        //    aimbot that snaps through walls usually fails this. We compare the shooter's view
+        //    direction (yaw/pitch from their state) to the direction toward the target.
+        //    Generous threshold to tolerate latency, projectile spread, and big hitboxes.
+        if (dist > 1.6) {                               // skip for point-blank / melee
+          const yaw = player.yaw || 0, pitch = player.pitch || 0;
+          // forward vector matching the client's camera basis (yaw about Y, then pitch about X)
+          const fx = -Math.sin(yaw) * Math.cos(pitch);
+          const fy = Math.sin(pitch);
+          const fz = -Math.cos(yaw) * Math.cos(pitch);
+          const inv = 1 / (dist || 1);
+          const dot = (dx*inv)*fx + (dy*inv)*fy + (dz*inv)*fz;   // cos(angle) shooter->target vs aim
+          if (dot < 0.55) return;                       // target is >~57° off the shooter's aim -> drop
+        }
+        // 4) clamp damage to a believable per-hit maximum (kills the 9999 one-shot hacks)
         let dmg = +m.dmg || 0;
         if (dmg <= 0) return;
-        dmg = Math.min(dmg, 220);                     // allow sniper-HS / knife tiers, block 9999 hacks
+        dmg = Math.min(dmg, 220);                       // allow sniper-HS / knife tiers, block 9999 hacks
+        // would this hit be lethal? if so, enforce a kill cooldown so one client can't
+        // instantly wipe several players in the same tick (mass-aimbot pattern).
+        const lethal = (tgt.hp ?? 100) - dmg <= 0;
+        if (lethal && (now - (player._lastKill || 0)) < 300) return;  // too many kills too fast -> drop
         tgt.hp = Math.max(0, (tgt.hp ?? 100) - dmg);
         send(tgt.ws, { t: 'hurt', by: player.id, dmg, hp: tgt.hp });
         if (tgt.hp <= 0) {
+          player._lastKill = now;
           tgt.dead = true;            // lock out further hits until they respawn
           player.kills++; tgt.deaths++;
           player.streak = (player.streak || 0) + 1;
