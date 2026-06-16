@@ -40,6 +40,7 @@ function leaderboard(cat, limit) {
   const rows = Object.entries(DB).map(([wallet, s]) => {
     const kd = s.deaths > 0 ? s.kills / s.deaths : s.kills;
     return { name: s.name, wallet: wallet.length > 8 ? wallet.slice(0, 4) + '\u2026' + wallet.slice(-4) : wallet,
+             walletFull: wallet,
              kills: s.kills, deaths: s.deaths, wins: s.wins, score: s.score,
              bestStreak: s.bestStreak, nukes: s.nukes||0, kd: +kd.toFixed(2), matches: s.matches };
   }).filter(r => r.matches > 0);
@@ -64,6 +65,7 @@ function zleaderboard(cat, limit) {
   const key = ['bestRound', 'bestScore', 'kills', 'hs', 'games', 'totalPoints'].includes(cat) ? cat : 'bestRound';
   const rows = Object.entries(ZDB).map(([wallet, s]) => ({
     name: s.name, wallet: wallet.length > 8 ? wallet.slice(0, 4) + '\u2026' + wallet.slice(-4) : wallet,
+    walletFull: wallet,
     bestRound: s.bestRound||0, bestScore: s.bestScore||0, kills: s.kills||0,
     hs: s.hs||0, games: s.games||0, totalPoints: s.totalPoints||0
   })).filter(r => r.games > 0);
