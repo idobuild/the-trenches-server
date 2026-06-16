@@ -390,8 +390,8 @@ wss.on('connection', (ws) => {
           // a single kill event, tagged with a unique id so the client can de-dup
           broadcast(room, { t: 'kill', id: 'k' + (nextId++), killer: player.id, victim: tgt.id,
                             kn: player.name, vn: tgt.name, head: !!m.head, wep: player.wep });
-          // clear the dead-lock + restore HP after the respawn delay
-          tgt.hp = 100;
+          // keep them DOWN (hp 0, dead-locked) until the respawn delay, then revive
+          tgt.hp = 0;
           setTimeout(() => { if (tgt) { tgt.dead = false; tgt.hp = 100; } }, 2500);
         }
       }
