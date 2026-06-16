@@ -31,9 +31,15 @@ function dbGet(wallet, name) {
   if (name) DB[wallet].name = name;
   return DB[wallet];
 }
-function dbMark() { _dbDirty = true; }
-function dbSave() { if (!_dbDirty) return; _dbDirty = false; try { fs.writeFileSync(DB_FILE, JSON.stringify(DB)); } catch (e) {} }
+function dbMark() { _dbDirty = true; dbSaveSoon(); }
+let _dbSaveT = null;
+function dbSaveSoon(){ if(_dbSaveT) return; _dbSaveT = setTimeout(()=>{ _dbSaveT=null; dbSave(); }, 500); }
+function dbSave() { if (!_dbDirty) return; _dbDirty = false;
+  try { const tmp = DB_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(DB)); fs.renameSync(tmp, DB_FILE); } catch (e) {} }
 setInterval(dbSave, 5000);
+// flush to disk on shutdown so a redeploy/restart never loses the latest stats
+process.on('SIGTERM', () => { try{dbSave();zSave&&zSave();}catch(e){} process.exit(0); });
+process.on('SIGINT',  () => { try{dbSave();zSave&&zSave();}catch(e){} process.exit(0); });
 
 function leaderboard(cat, limit) {
   const key = ['kd', 'kills', 'score', 'wins', 'bestStreak', 'nukes'].includes(cat) ? cat : 'kills';
@@ -59,7 +65,10 @@ function zGet(wallet, name) {
   if (name) ZDB[wallet].name = name;
   return ZDB[wallet];
 }
-function zSave() { if (!_zDirty) return; _zDirty = false; try { fs.writeFileSync(ZDB_FILE, JSON.stringify(ZDB)); } catch (e) {} }
+let _zSaveT = null;
+function zMark(){ _zDirty = true; if(_zSaveT) return; _zSaveT = setTimeout(()=>{ _zSaveT=null; zSave(); }, 500); }
+function zSave() { if (!_zDirty) return; _zDirty = false;
+  try { const tmp = ZDB_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(ZDB)); fs.renameSync(tmp, ZDB_FILE); } catch (e) {} }
 setInterval(zSave, 5000);
 function zleaderboard(cat, limit) {
   const key = ['bestRound', 'bestScore', 'kills', 'hs', 'games', 'totalPoints'].includes(cat) ? cat : 'bestRound';
@@ -117,6 +126,19 @@ const server = http.createServer((req, res) => {
     const cat = u.searchParams.get('cat') || 'bestRound';
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(zleaderboard(cat, 100)));
+    return;
+  }
+
+  // ---- debug: see exactly what the server has stored (open in a browser) ----
+  if (req.url && req.url.startsWith('/debug')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      players_count: Object.keys(DB).length,
+      zombies_count: Object.keys(ZDB).length,
+      dataDir: DATA_DIR,
+      players: DB,
+      zombies: ZDB
+    }, null, 2));
     return;
   }
 
@@ -240,7 +262,7 @@ wss.on('connection', (ws) => {
       s.totalPoints = (s.totalPoints || 0) + (m.points | 0);
       if ((m.round | 0) > (s.bestRound || 0)) s.bestRound = m.round | 0;
       if ((m.points | 0) > (s.bestScore || 0)) s.bestScore = m.points | 0;
-      _zDirty = true;
+      zMark();
       send(ws, { t: 'zok' });
       return;
     }
