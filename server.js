@@ -256,12 +256,28 @@ wss.on('connection', (ws) => {
     /* ----- submit a Zombies result to the global Zombies board ----- */
     if (m.t === 'zsubmit') {
       const s = zGet(('' + (m.wallet || '')).slice(0, 44), ('' + (m.name || 'OPERATOR')).toUpperCase().slice(0, 16));
-      s.games = (s.games || 0) + 1;
-      s.kills = (s.kills || 0) + (m.kills | 0);
-      s.hs = (s.hs || 0) + (m.hs | 0);
-      s.totalPoints = (s.totalPoints || 0) + (m.points | 0);
-      if ((m.round | 0) > (s.bestRound || 0)) s.bestRound = m.round | 0;
-      if ((m.points | 0) > (s.bestScore || 0)) s.bestScore = m.points | 0;
+      const round = m.round | 0, pts = m.points | 0, kills = m.kills | 0, hs = m.hs | 0;
+      // The client now submits every round (so a high round is saved even if it crashes before
+      // the death screen). To avoid inflating totals, treat a submit as an UPDATE of the current
+      // run when the round/points are climbing; only count a brand-new game when a fresh run
+      // starts (round resets back to <= 1, or lower than what we last saw this run).
+      const lastRound = s._lastRound || 0;
+      if (round <= 1 || round < lastRound) {
+        // a new run has begun
+        s.games = (s.games || 0) + 1;
+        s._runKills = 0; s._runPts = 0;
+      }
+      // accumulate kills/points as deltas within the current run so totals stay accurate
+      const dK = Math.max(0, kills - (s._runKills || 0));
+      const dP = Math.max(0, pts - (s._runPts || 0));
+      s.kills = (s.kills || 0) + dK;
+      s.totalPoints = (s.totalPoints || 0) + dP;
+      s._runKills = kills; s._runPts = pts;
+      s.hs = Math.max(s.hs || 0, hs);   // headshots reported cumulatively for the run
+      if (round > (s.bestRound || 0)) s.bestRound = round;
+      if (pts > (s.bestScore || 0)) s.bestScore = pts;
+      s._lastRound = round;
+      if ((s.games || 0) < 1) s.games = 1;   // ensure they show on the board
       zMark();
       send(ws, { t: 'zok' });
       return;
