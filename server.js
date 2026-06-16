@@ -338,8 +338,24 @@ wss.on('connection', (ws) => {
       const tgt = room.players.get(m.id);
       // never credit a hit on yourself, and ignore hits on someone already downed
       if (tgt && tgt.id !== player.id && !tgt.dead) {
-        tgt.hp = Math.max(0, (tgt.hp ?? 100) - (m.dmg || 0));
-        send(tgt.ws, { t: 'hurt', by: player.id, dmg: m.dmg, hp: tgt.hp });
+        // ---- ANTI-CHEAT VALIDATION ----
+        const now = Date.now();
+        // 1) rate limit: no more than ~20 damage events/sec from one shooter
+        player._hitWin = player._hitWin || [];
+        player._hitWin = player._hitWin.filter(t => now - t < 1000);
+        if (player._hitWin.length >= 20) return;     // firing impossibly fast -> drop
+        player._hitWin.push(now);
+        // 2) distance sanity: shooter & target positions are known from 'state' updates.
+        //    A bullet can't land if the two are absurdly far apart (shooting across/through the map).
+        const dx = (player.x||0)-(tgt.x||0), dy=(player.y||0)-(tgt.y||0), dz=(player.z||0)-(tgt.z||0);
+        const dist = Math.sqrt(dx*dx+dy*dy+dz*dz);
+        if (dist > 140) return;                       // beyond any sightline on this map -> drop
+        // 3) clamp damage to a believable per-hit maximum (kills the 9999 one-shot hacks)
+        let dmg = +m.dmg || 0;
+        if (dmg <= 0) return;
+        dmg = Math.min(dmg, 220);                     // allow sniper-HS / knife tiers, block 9999 hacks
+        tgt.hp = Math.max(0, (tgt.hp ?? 100) - dmg);
+        send(tgt.ws, { t: 'hurt', by: player.id, dmg, hp: tgt.hp });
         if (tgt.hp <= 0) {
           tgt.dead = true;            // lock out further hits until they respawn
           player.kills++; tgt.deaths++;
